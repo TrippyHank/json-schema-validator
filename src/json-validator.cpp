@@ -14,6 +14,7 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <string>
 
 using nlohmann::json;
 using nlohmann::json_patch;
@@ -39,6 +40,16 @@ class schema
 protected:
 	root_schema *root_;
 	json default_value_ = nullptr;
+
+protected:
+	virtual std::shared_ptr<schema> make_for_default_(
+	    std::shared_ptr<::schema> & /* sch */,
+	    root_schema * /* root */,
+	    std::vector<nlohmann::json_uri> & /* uris */,
+	    nlohmann::json & /* default_value */) const
+	{
+		return nullptr;
+	};
 
 public:
 	virtual ~schema() = default;
@@ -91,6 +102,21 @@ class schema_ref : public schema
 
 		return default_value_;
 	}
+
+protected:
+	virtual std::shared_ptr<schema> make_for_default_(
+	    std::shared_ptr<::schema> &sch,
+	    root_schema *root,
+	    std::vector<nlohmann::json_uri> &uris,
+	    nlohmann::json &default_value) const override
+	{
+		// create a new reference schema using the original reference (which will be resolved later)
+		// to store this overloaded default value #209
+		auto result = std::make_shared<schema_ref>(uris[0].to_string(), root);
+		result->set_target(sch, true);
+		result->set_default_value(default_value);
+		return result;
+	};
 
 public:
 	schema_ref(const std::string &id, root_schema *root)
@@ -179,7 +205,7 @@ public:
 		auto fragment = new_uri.pointer();
 
 		// is there a reference looking for this unknown-keyword, which is thus no longer a unknown keyword but a schema
-		auto unresolved = file.unresolved.find(fragment);
+		auto unresolved = file.unresolved.find(fragment.to_string());
 		if (unresolved != file.unresolved.end())
 			schema::make(value, this, {}, {{new_uri}});
 		else { // no, nothing ref'd it, keep for later
@@ -283,11 +309,31 @@ public:
 				break;
 		} while (1);
 
-		for (const auto &file : files_)
-			if (file.second.unresolved.size() != 0)
+		for (const auto &file : files_) {
+			if (file.second.unresolved.size() != 0) {
+				// Build a representation of the undefined
+				// references as a list of comma-separated strings.
+				auto n_urefs = file.second.unresolved.size();
+				std::string urefs = "[";
+
+				decltype(n_urefs) counter = 0;
+				for (const auto &p : file.second.unresolved) {
+					urefs += p.first;
+
+					if (counter != n_urefs - 1u) {
+						urefs += ", ";
+					}
+
+					++counter;
+				}
+
+				urefs += "]";
+
 				throw std::invalid_argument("after all files have been parsed, '" +
 				                            (file.first == "" ? "<root>" : file.first) +
-				                            "' has still undefined references.");
+				                            "' has still the following undefined references: " + urefs);
+			}
+		}
 	}
 
 	void validate(const json::json_pointer &ptr,
@@ -457,6 +503,7 @@ class type_schema : public schema
 	std::vector<std::shared_ptr<schema>> type_;
 	std::pair<bool, json> enum_, const_;
 	std::vector<std::shared_ptr<schema>> logic_;
+	bool read_only_ = false;
 
 	static std::shared_ptr<schema> make(json &schema,
 	                                    json::value_t type,
@@ -507,7 +554,29 @@ class type_schema : public schema
 					else_->validate(ptr, instance, patch, e);
 			}
 		}
+		
+		if (instance.is_null())
+			patch.add(nlohmann::json::json_pointer{}, default_value_);
+
+    	// enforce default value if any read only values
+		if(read_only_) {
+			auto rod_value = default_value(ptr, instance, e);
+			if(rod_value != nullptr && instance != rod_value)
+				e.error(ptr, instance, "key is read-only");
+		}
 	}
+
+protected:
+	virtual std::shared_ptr<schema> make_for_default_(
+	    std::shared_ptr<::schema> & /* sch */,
+	    root_schema * /* root */,
+	    std::vector<nlohmann::json_uri> & /* uris */,
+	    nlohmann::json &default_value) const override
+	{
+		auto result = std::make_shared<type_schema>(*this);
+		result->set_default_value(default_value);
+		return result;
+	};
 
 public:
 	type_schema(json &sch,
@@ -559,6 +628,12 @@ public:
 		attr = sch.find("default");
 		if (attr != sch.end()) {
 			set_default_value(attr.value());
+			sch.erase(attr);
+		}
+
+		attr = sch.find("readOnly");
+		if (attr != sch.end()) {
+			read_only_ = attr.value().get<bool>();
 			sch.erase(attr);
 		}
 
@@ -892,8 +967,8 @@ class boolean : public schema
 	{
 		if (!true_) { // false schema
 			// empty array
-			//switch (instance.type()) {
-			//case json::value_t::array:
+			// switch (instance.type()) {
+			// case json::value_t::array:
 			//	if (instance.size() != 0) // valid false-schema
 			//		e.error(ptr, instance, "false-schema required empty array");
 			//	return;
@@ -1075,6 +1150,11 @@ public:
 		if (attr != sch.end()) {
 			propertyNames_ = schema::make(attr.value(), root, {"propertyNames"}, uris);
 			sch.erase(attr);
+		}
+
+		attr = sch.find("default");
+		if (attr != sch.end()) {
+			set_default_value(*attr);
 		}
 	}
 };
@@ -1289,16 +1369,8 @@ std::shared_ptr<schema> schema::make(json &schema,
 			attr = schema.find("default");
 			if (attr != schema.end()) {
 				// copy the referenced schema depending on the underlying type and modify the default value
-				if (dynamic_cast<schema_ref *>(sch.get())) {
-					// create a new reference schema use the original reference (which will be resolved later)
-					// to store this overloaed default value #209
-					auto overloaded_ref_sch = std::make_shared<schema_ref>(uris[0].to_string(), root);
-					overloaded_ref_sch->set_target(sch, true);
-					overloaded_ref_sch->set_default_value(attr.value());
-					sch = overloaded_ref_sch;
-				} else if (auto *type_sch = dynamic_cast<type_schema *>(sch.get())) {
-					sch = std::make_shared<type_schema>(*type_sch);
-					sch->set_default_value(attr.value());
+				if (auto new_sch = sch->make_for_default_(sch, root, uris, attr.value())) {
+					sch = new_sch;
 				}
 				schema.erase(attr);
 			}
@@ -1327,7 +1399,7 @@ class throwing_error_handler : public error_handler
 {
 	void error(const json::json_pointer &ptr, const json &instance, const std::string &message) override
 	{
-		throw std::invalid_argument(std::string("At ") + ptr.to_string() + " of " + instance.dump() + " - " + message + "\n");
+		throw std::invalid_argument(std::string("at ") + ptr.to_string() + " of " + instance.dump() + " - " + message);
 	}
 };
 
@@ -1402,3 +1474,4 @@ json json_validator::validate(const json &instance, error_handler &err, const js
 
 } // namespace json_schema
 } // namespace nlohmann
+
